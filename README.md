@@ -22,7 +22,7 @@ transcribe reuniao.mp4
 ## Instalação
 
 ```bash
-git clone <url-deste-repo> transcribe
+git clone https://github.com/me-thiago/transcribe.git
 cd transcribe
 ./install.sh
 ```
