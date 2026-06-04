@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# dictate — grava o microfone e transcreve (companion do transcribe).
+
+set -eo pipefail
+
+PROG=${0##*/}
+err() { printf '%s: %s\n' "$PROG" "$1" >&2; }
+die() { err "$1"; exit "${2:-1}"; }
+
+usage() {
+  cat >&2 <<'EOF'
+dictate — grava o microfone e transcreve
+
+Uso:
+  dictate [-o <pasta>] [-a] [-l <idioma>] [-d <índice>] [nome]
+
+Opções:
+  -o <pasta>    onde salvar (padrão: ~/VozMemos)
+  -a            só grava o áudio, NÃO transcreve (--so-audio)
+  -l <idioma>   idioma da transcrição (padrão: pt; "auto" detecta)
+  -d <índice>   índice do dispositivo de áudio (padrão: 0)
+  --list        lista os dispositivos de captura e sai
+  nome          nome base do arquivo (padrão: timestamp)
+
+Durante a gravação, aperte  q  pra parar (Ctrl-C também funciona).
+
+Saída: <pasta>/<nome>.opus e, se transcrever, <pasta>/<nome>.transcricao/
+
+Pré-requisitos: ffmpeg (brew install ffmpeg) e o app do terminal com permissão
+de microfone (Ajustes > Privacidade > Microfone). Pra transcrever: o comando transcribe.
+EOF
+}
+
+OUTBASE=""; LANG_CODE="pt"; DEV="0"; AUDIO_ONLY=false
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage; exit 0 ;;
+    --list)
+      ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 |
+        sed -n '/audio devices/,$ p' | grep -E '^\[.*\] \[[0-9]+\]' || true
+      exit 0 ;;
+    -o | --out) [ -n "${2:-}" ] || die "-o requer um diretório"; OUTBASE="$2"; shift 2 ;;
+    -o=* | --out=*) OUTBASE="${1#*=}"; shift ;;
+    -a | --so-audio | --audio) AUDIO_ONLY=true; shift ;;
+    -l | --lang) [ -n "${2:-}" ] || die "-l requer um idioma"; LANG_CODE="$2"; shift 2 ;;
+    -d | --device) [ -n "${2:-}" ] || die "-d requer um índice"; DEV="$2"; shift 2 ;;
+    --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+    -*) die "opção desconhecida: $1 (veja --help)" ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+set -- "${positional[@]}"
+
+command -v ffmpeg >/dev/null || die "ffmpeg não encontrado — instale: brew install ffmpeg"
+
+PARENT="${OUTBASE:-$HOME/VozMemos}"
+mkdir -p "$PARENT" || die "não consegui criar $PARENT"
+PARENT=$(cd "$PARENT" && pwd)
+
+NAME="${1:-$(date +%Y-%m-%d-%H%M%S)}"
+AUDIO="$PARENT/$NAME.opus"
+
+echo "🔴 gravando de [:$DEV] — aperte  q  pra parar (Ctrl-C também)" >&2
+# avfoundation: ":$DEV" = sem vídeo, dispositivo de áudio $DEV
+ffmpeg -hide_banner -loglevel error -stats -y -f avfoundation -i ":$DEV" \
+  -ac 1 -c:a libopus -b:a 48k "$AUDIO" || true
+
+[ -s "$AUDIO" ] || die "nada foi gravado — o app do terminal tem permissão de microfone? (veja --help)"
+secs=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$AUDIO" 2>/dev/null | cut -d. -f1)
+echo "💾 áudio salvo: $AUDIO (${secs:-?}s)" >&2
+
+$AUDIO_ONLY && exit 0
+
+command -v transcribe >/dev/null ||
+  die "comando 'transcribe' não encontrado — instale-o pra transcrever, ou use -a pra só gravar"
+echo "📝 transcrevendo..." >&2
+transcribe -o "$PARENT" "$AUDIO" "$LANG_CODE"

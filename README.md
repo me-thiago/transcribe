@@ -2,7 +2,7 @@
 
 Transcreve áudio e vídeo via [ElevenLabs Scribe](https://elevenlabs.io/) — **diarizado** (separa falantes), com timestamps, em português por padrão. Um comando de shell, self-contained.
 
-Feito pra transcrever reuniões, recados de voz e gravações de tela — local ou direto de uma máquina remota via SSH.
+Feito pra transcrever reuniões, recados de voz e gravações de tela — local ou direto de uma máquina remota via SSH. Inclui o companion [`dictate`](#dictate--gravar-do-microfone), que grava o microfone no terminal e já transcreve.
 
 ```bash
 transcribe reuniao.mp4
@@ -66,6 +66,23 @@ Sempre cria a subpasta `<nome>.transcricao/` (ao lado do arquivo; no diretório 
 | `<nome>.md` | diarizado, com timestamps por trecho |
 | `<nome>.txt` | texto corrido |
 | `<nome>.json` | resposta bruta da ElevenLabs (timing palavra-a-palavra) |
+
+## `dictate` — gravar do microfone
+
+Companion que grava o microfone direto no terminal e já transcreve (reusa o `transcribe`).
+
+```bash
+dictate                       # grava → q pra parar → transcreve. Salva em ~/VozMemos/
+dictate reuniao-rapida        # define o nome base
+dictate -a recado             # só grava o áudio, NÃO transcreve
+dictate -o ~/Desktop nota     # escolhe onde salvar
+dictate -l en                 # idioma da transcrição (padrão: pt)
+dictate -d 1                  # outro microfone (--list mostra os índices)
+```
+
+Durante a gravação, aperte **`q`** pra parar. Saída: `<pasta>/<nome>.opus` e, se transcrever, `<pasta>/<nome>.transcricao/`.
+
+> **Permissão:** o macOS exige que o app do terminal tenha acesso ao microfone (*Ajustes → Privacidade → Microfone*). Na 1ª gravação ele pergunta; se negar, o `dictate` avisa que nada foi gravado.
 
 ## Como funciona
 

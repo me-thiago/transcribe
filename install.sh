@@ -9,8 +9,10 @@ REPO_DIR=$(cd "$(dirname "$0")" && pwd)
 BIN_DIR="$HOME/.local/bin"
 
 mkdir -p "$BIN_DIR"
-ln -sf "$REPO_DIR/transcribe" "$BIN_DIR/transcribe"
-echo "✓ symlink: $BIN_DIR/transcribe -> $REPO_DIR/transcribe"
+for cmd in transcribe dictate; do
+  ln -sf "$REPO_DIR/$cmd" "$BIN_DIR/$cmd"
+  echo "✓ symlink: $BIN_DIR/$cmd -> $REPO_DIR/$cmd"
+done
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
