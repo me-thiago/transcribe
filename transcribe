@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#
+# transcribe — transcreve áudio/vídeo via ElevenLabs Scribe (diarizado).
+# Self-contained: copie este arquivo e configure sua própria ELEVENLABS_API_KEY.
+
+set -eo pipefail
+
+PROG=${0##*/}
+msg() { printf '  %s\n' "$1" >&2; }
+err() { printf '%s: %s\n' "$PROG" "$1" >&2; }
+die() { err "$1"; exit "${2:-1}"; }
+
+usage() {
+  cat >&2 <<'EOF'
+transcribe — transcreve áudio/vídeo via ElevenLabs Scribe (diarizado)
+
+Uso:
+  transcribe [-o <pasta>] <arquivo|host:caminho> [idioma]
+
+Exemplos:
+  transcribe reuniao.mp4                      vídeo local (extrai o áudio)
+  transcribe nota.m4a                         áudio local (envia direto)
+  transcribe macmini:~/Downloads/call.webm    arquivo remoto via SSH (stream)
+  transcribe call.mp4 en                      força inglês
+  transcribe call.mp4 auto                    detecta o idioma automaticamente
+  transcribe reuniao.mp4 -o ~/Transcricoes    escolhe onde criar a subpasta
+
+Idioma:     padrão "pt"; use um código ISO (en, es, ...) ou "auto".
+-o <pasta>: pasta-pai onde criar a subpasta (padrão: pasta do arquivo; CWD se remoto).
+
+Saída: cria a subpasta <nome>.transcricao/ contendo
+  <nome>.md     diarizado, com timestamps
+  <nome>.txt    texto corrido
+  <nome>.json   resposta bruta da ElevenLabs
+
+Pré-requisitos:
+  ELEVENLABS_API_KEY no ambiente OU em ~/.config/transcribe/env
+  jq        (brew install jq)
+  ffmpeg    (brew install ffmpeg) — só pra vídeo / áudio grande
+EOF
+}
+
+OUTBASE=""
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage; exit 0 ;;
+    -o | --out)
+      [ -n "${2:-}" ] || die "-o requer um diretório"
+      OUTBASE="$2"; shift 2 ;;
+    -o=* | --out=*) OUTBASE="${1#*=}"; shift ;;
+    --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+    -*) die "opção desconhecida: $1 (veja --help)" ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+set -- "${positional[@]}"
+[ $# -ge 1 ] || { usage; exit 1; }
+
+INPUT="$1"
+LANG_CODE="${2:-pt}"
+
+# --- API key: env var, senão ~/.config/transcribe/env ---
+if [ -z "${ELEVENLABS_API_KEY:-}" ] && [ -f "$HOME/.config/transcribe/env" ]; then
+  ELEVENLABS_API_KEY=$(grep -m1 '^ELEVENLABS_API_KEY=' "$HOME/.config/transcribe/env" |
+    cut -d= -f2- | tr -d "\"' \t\r\n")
+fi
+[ -n "${ELEVENLABS_API_KEY:-}" ] || die \
+  "ELEVENLABS_API_KEY não definida. Exporte no shell (export ELEVENLABS_API_KEY=sk_...) ou crie ~/.config/transcribe/env com a linha ELEVENLABS_API_KEY=sk_..."
+
+command -v curl >/dev/null || die "curl não encontrado"
+command -v jq >/dev/null || die "jq não encontrado — instale: brew install jq"
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/transcribe.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+
+# --- local vs remoto (host:caminho, estilo scp) ---
+REMOTE=""; RPATH=""
+if [ ! -e "$INPUT" ] && [[ "$INPUT" == *:* ]] && [[ "$INPUT" != /* ]]; then
+  REMOTE="${INPUT%%:*}"; RPATH="${INPUT#*:}"
+  BASE="${RPATH##*/}"; SRCDIR="$PWD"
+elif [ -e "$INPUT" ]; then
+  BASE="${INPUT##*/}"; SRCDIR=$(cd "$(dirname "$INPUT")" && pwd)
+else
+  die "'$INPUT' não existe (nem parece host:caminho)"
+fi
+STEM="${BASE%.*}"; EXT="${BASE##*.}"
+
+# Saída sempre numa subpasta <stem>.transcricao/ (pai = -o, senão a pasta da
+# origem; o CWD quando o arquivo é remoto).
+OUTDIR="${OUTBASE:-$SRCDIR}/$STEM.transcricao"
+
+# --- obter o áudio a enviar ---
+# Vídeo, áudio grande ou remoto -> extrai/comprime pra Opus mono com ffmpeg.
+# Áudio pequeno local -> envia o original direto (sem ffmpeg).
+UPLOAD=""; UPLOAD_NAME=""
+if [ -n "$REMOTE" ]; then
+  command -v ffmpeg >/dev/null || die "ffmpeg necessário pra arquivos remotos — instale: brew install ffmpeg"
+  command -v ssh >/dev/null || die "ssh não encontrado"
+  msg "stream de $REMOTE via SSH + extração de áudio..."
+  ssh "$REMOTE" "cat \"$RPATH\"" |
+    ffmpeg -hide_banner -loglevel error -y -i pipe:0 -vn -ac 1 -c:a libopus -b:a 48k "$WORK/audio.opus"
+  UPLOAD="$WORK/audio.opus"; UPLOAD_NAME="audio.opus"
+else
+  is_video=false
+  if command -v ffprobe >/dev/null; then
+    [ -n "$(ffprobe -v error -select_streams v -show_entries stream=codec_type -of csv=p=0 "$INPUT" 2>/dev/null)" ] && is_video=true
+  else
+    case "$EXT" in
+      mp4 | mov | mkv | webm | avi | m4v | flv | wmv | mpg | mpeg | 3gp | MP4 | MOV | MKV | WEBM | AVI | M4V | MPG) is_video=true ;;
+    esac
+  fi
+  size=$(stat -f%z "$INPUT" 2>/dev/null || echo 0)
+  if $is_video || [ "$size" -gt 104857600 ]; then
+    command -v ffmpeg >/dev/null || die "ffmpeg necessário pra vídeo/áudio grande — instale: brew install ffmpeg"
+    msg "extraindo áudio com ffmpeg..."
+    ffmpeg -hide_banner -loglevel error -y -i "$INPUT" -vn -ac 1 -c:a libopus -b:a 48k "$WORK/audio.opus"
+    UPLOAD="$WORK/audio.opus"; UPLOAD_NAME="audio.opus"
+  else
+    UPLOAD="$INPUT"; UPLOAD_NAME="audio.$EXT"
+  fi
+fi
+
+# --- transcrição ---
+msg "transcrevendo via ElevenLabs scribe_v2 (idioma: $LANG_CODE)..."
+lang_args=()
+[ "$LANG_CODE" != "auto" ] && lang_args=(-F "language_code=$LANG_CODE")
+code=$(curl -sS -X POST https://api.elevenlabs.io/v1/speech-to-text \
+  -H "xi-api-key: $ELEVENLABS_API_KEY" \
+  -F "file=@$UPLOAD;filename=$UPLOAD_NAME" \
+  -F model_id=scribe_v2 \
+  -F diarize=true \
+  "${lang_args[@]}" \
+  -w '%{http_code}' -o "$WORK/transcript.json" --max-time 1800 || true)
+[ "$code" = "200" ] || die "ElevenLabs retornou HTTP ${code:-?}: $(head -c 300 "$WORK/transcript.json" 2>/dev/null)"
+
+# --- saída ---
+mkdir -p "$OUTDIR" || die "não consegui criar a pasta de saída: $OUTDIR"
+OUTDIR=$(cd "$OUTDIR" && pwd)
+MD="$OUTDIR/$STEM.md"
+TXT="$OUTDIR/$STEM.txt"
+JSON="$OUTDIR/$STEM.json"
+cp "$WORK/transcript.json" "$JSON"
+jq -r '.text' "$WORK/transcript.json" >"$TXT"
+
+# Markdown diarizado: agrupa palavras por falante (novo trecho ao trocar de
+# falante ou após gap > 2s), mapeia speaker_id -> "Falante N" por ordem de aparição.
+jq -r --arg titulo "$STEM" '
+  def hms(s): (s|floor) as $t
+    | [($t/3600|floor), (($t%3600)/60|floor), ($t%60)]
+    | map(tostring | if length < 2 then "0" + . else . end) | join(":");
+  [.words[] | select(.type == "word")] as $w
+  | ($w | reduce .[] as $x ([];
+      (($x.speaker_id // "speaker_0")) as $spk
+      | (if length > 0 then .[-1] else null end) as $cur
+      | if $cur == null or $cur.speaker != $spk or ($x.start - $cur.end) > 2
+        then . + [{speaker: $spk, start: $x.start, end: $x.end, text: $x.text}]
+        else .[0:-1] + [$cur + {end: $x.end,
+              text: ($cur.text + (if ($x.text | test("^[.,!?;:]")) then "" else " " end) + $x.text)}]
+        end)) as $segs
+  | ([$segs[].speaker] | reduce .[] as $s ({m: {}, n: 0};
+        if .m[$s] then . else {m: (.m + {($s): (.n + 1)}), n: (.n + 1)} end)).m as $labels
+  | ($w | if length > 0 then .[-1].end else 0 end) as $dur
+  | "# Transcrição — \($titulo)\n",
+    "- **Duração:** \(hms($dur))",
+    "- **Idioma:** \(.language_code // "n/a")\(if .language_probability then " (\((.language_probability * 100) | floor)%)" else "" end)",
+    "- **Falantes detectados:** \($labels | length)",
+    "- **Modelo:** scribe_v2 (ElevenLabs) · diarização ativada\n",
+    "---\n",
+    ($segs[] | "**Falante \($labels[.speaker])** `[\(hms(.start))]`\n\n\(.text | ltrimstr(" "))\n")
+  ' "$WORK/transcript.json" >"$MD"
+
+# --- resumo ---
+read -r dur nspk nwords < <(jq -r '
+  [.words[] | select(.type == "word")] as $w
+  | "\(($w | if length > 0 then .[-1].end else 0 end) | floor) \([$w[] | .speaker_id // "speaker_0"] | unique | length) \($w | length)"
+  ' "$WORK/transcript.json") || true
+printf '\n\342\234\205 %s\n' "$BASE" >&2
+printf '   ~%dm%02ds \302\267 %s falante(s) \302\267 %s palavras\n' "$((dur / 60))" "$((dur % 60))" "$nspk" "$nwords" >&2
+printf '   %s\n   %s\n   %s\n' "$MD" "$TXT" "$JSON" >&2
