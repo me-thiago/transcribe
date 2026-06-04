@@ -8,6 +8,17 @@ PROG=${0##*/}
 err() { printf '%s: %s\n' "$PROG" "$1" >&2; }
 die() { err "$1"; exit "${2:-1}"; }
 
+# "2h" | "90m" | "30s" | "7200" -> seconds (echoes empty if not a valid integer duration)
+to_seconds() {
+  local v="$1" n
+  case "$v" in
+    *h) n="${v%h}"; case "$n" in *[!0-9]* | "") echo ""; return ;; esac; echo $((n * 3600)) ;;
+    *m) n="${v%m}"; case "$n" in *[!0-9]* | "") echo ""; return ;; esac; echo $((n * 60)) ;;
+    *s) n="${v%s}"; case "$n" in *[!0-9]* | "") echo ""; return ;; esac; echo "$n" ;;
+    *)  case "$v" in *[!0-9]* | "") echo ""; return ;; esac; echo "$v" ;;
+  esac
+}
+
 usage() {
   cat >&2 <<'EOF'
 dictate — record the microphone and transcribe
@@ -22,12 +33,14 @@ Options:
   -k, --keyterms <l>   comma-separated terms/names to boost accuracy
   -s, --speakers <n>   expected number of speakers
   -d, --device <i>     audio input device index (default: 0)
+  -t, --max <dur>      max recording length, auto-stops (default: 2h; e.g. 90m, 30s)
       --open           open the result when done
       --list           list capture devices and exit
   -h, --help
   name                 base file name (default: timestamp)
 
 While recording:  press  q  to stop & transcribe  ·  Ctrl-C to cancel (discard).
+Recording auto-stops at the --max cap (default 2h) to avoid runaway captures.
 
 Output: <dir>/<name>.opus and, unless -a, <dir>/<name>.transcript/
 
@@ -36,7 +49,7 @@ terminal app (Settings > Privacy > Microphone). To transcribe: the transcribe co
 EOF
 }
 
-OUTBASE=""; LANG_CODE="pt"; DEV="0"; AUDIO_ONLY=false; KEYTERMS=""; SPEAKERS=""; OPEN=false
+OUTBASE=""; LANG_CODE="pt"; DEV="0"; AUDIO_ONLY=false; KEYTERMS=""; SPEAKERS=""; OPEN=false; MAXDUR="2h"
 positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -56,6 +69,8 @@ while [ $# -gt 0 ]; do
     -s=* | --speakers=*) SPEAKERS="${1#*=}"; shift ;;
     -d | --device) [ -n "${2:-}" ] || die "-d requires an index"; DEV="$2"; shift 2 ;;
     -d=* | --device=*) DEV="${1#*=}"; shift ;;
+    -t | --max) [ -n "${2:-}" ] || die "-t requires a duration"; MAXDUR="$2"; shift 2 ;;
+    -t=* | --max=*) MAXDUR="${1#*=}"; shift ;;
     --open) OPEN=true; shift ;;
     --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
     -*) die "unknown option: $1 (see --help)" ;;
@@ -66,6 +81,11 @@ set -- "${positional[@]}"
 
 command -v ffmpeg >/dev/null || die "ffmpeg not found — install: brew install ffmpeg"
 
+MAXSECS=$(to_seconds "$MAXDUR")
+if [ -z "$MAXSECS" ] || [ "$MAXSECS" -le 0 ]; then
+  die "invalid --max '$MAXDUR' (use e.g. 2h, 90m, 30s, or a number of seconds)"
+fi
+
 PARENT="${OUTBASE:-$HOME/VoiceMemos}"
 mkdir -p "$PARENT" || die "could not create $PARENT"
 PARENT=$(cd "$PARENT" && pwd)
@@ -73,13 +93,14 @@ PARENT=$(cd "$PARENT" && pwd)
 NAME="${1:-$(date +%Y-%m-%d-%H%M%S)}"
 AUDIO="$PARENT/$NAME.opus"
 
-echo "🔴 recording from [:$DEV] — press  q  to stop & transcribe  ·  Ctrl-C to cancel" >&2
+echo "🔴 recording from [:$DEV] (max $MAXDUR) — press  q  to stop & transcribe  ·  Ctrl-C to cancel" >&2
 # Distinguish stop (q -> keep) from cancel (Ctrl-C -> discard): trap SIGINT so a
 # Ctrl-C marks the take as cancelled; ffmpeg finalizes either way, we discard on cancel.
+# -t caps the duration so a forgotten recording stops on its own.
 CANCELLED=false
 trap 'CANCELLED=true' INT
 ffmpeg -hide_banner -loglevel error -stats -y -f avfoundation -i ":$DEV" \
-  -ac 1 -c:a libopus -b:a 48k "$AUDIO" || true
+  -ac 1 -c:a libopus -b:a 48k -t "$MAXSECS" "$AUDIO" || true
 trap - INT
 
 if $CANCELLED; then
