@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dictate — grava o microfone e transcreve (companion do transcribe).
+# dictate — record the microphone and transcribe (companion to transcribe).
 
 set -eo pipefail
 
@@ -10,29 +10,33 @@ die() { err "$1"; exit "${2:-1}"; }
 
 usage() {
   cat >&2 <<'EOF'
-dictate — grava o microfone e transcreve
+dictate — record the microphone and transcribe
 
-Uso:
-  dictate [-o <pasta>] [-a] [-l <idioma>] [-d <índice>] [nome]
+Usage:
+  dictate [options] [name]
 
-Opções:
-  -o <pasta>    onde salvar (padrão: ~/VozMemos)
-  -a            só grava o áudio, NÃO transcreve (--so-audio)
-  -l <idioma>   idioma da transcrição (padrão: pt; "auto" detecta)
-  -d <índice>   índice do dispositivo de áudio (padrão: 0)
-  --list        lista os dispositivos de captura e sai
-  nome          nome base do arquivo (padrão: timestamp)
+Options:
+  -a, --audio-only     record only, do NOT transcribe
+  -o, --out <dir>      where to save (default: ~/VoiceMemos)
+  -l, --lang <code>    transcription language (default: pt; "auto" to detect)
+  -k, --keyterms <l>   comma-separated terms/names to boost accuracy
+  -s, --speakers <n>   expected number of speakers
+  -d, --device <i>     audio input device index (default: 0)
+      --open           open the result when done
+      --list           list capture devices and exit
+  -h, --help
+  name                 base file name (default: timestamp)
 
-Durante a gravação, aperte  q  pra parar (Ctrl-C também funciona).
+While recording:  press  q  to stop & transcribe  ·  Ctrl-C to cancel (discard).
 
-Saída: <pasta>/<nome>.opus e, se transcrever, <pasta>/<nome>.transcricao/
+Output: <dir>/<name>.opus and, unless -a, <dir>/<name>.transcript/
 
-Pré-requisitos: ffmpeg (brew install ffmpeg) e o app do terminal com permissão
-de microfone (Ajustes > Privacidade > Microfone). Pra transcrever: o comando transcribe.
+Requirements: ffmpeg (brew install ffmpeg) and microphone permission for your
+terminal app (Settings > Privacy > Microphone). To transcribe: the transcribe command.
 EOF
 }
 
-OUTBASE=""; LANG_CODE="pt"; DEV="0"; AUDIO_ONLY=false
+OUTBASE=""; LANG_CODE="pt"; DEV="0"; AUDIO_ONLY=false; KEYTERMS=""; SPEAKERS=""; OPEN=false
 positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,39 +45,63 @@ while [ $# -gt 0 ]; do
       ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 |
         sed -n '/audio devices/,$ p' | grep -E '^\[.*\] \[[0-9]+\]' || true
       exit 0 ;;
-    -o | --out) [ -n "${2:-}" ] || die "-o requer um diretório"; OUTBASE="$2"; shift 2 ;;
+    -a | --audio-only) AUDIO_ONLY=true; shift ;;
+    -o | --out) [ -n "${2:-}" ] || die "-o requires a directory"; OUTBASE="$2"; shift 2 ;;
     -o=* | --out=*) OUTBASE="${1#*=}"; shift ;;
-    -a | --so-audio | --audio) AUDIO_ONLY=true; shift ;;
-    -l | --lang) [ -n "${2:-}" ] || die "-l requer um idioma"; LANG_CODE="$2"; shift 2 ;;
-    -d | --device) [ -n "${2:-}" ] || die "-d requer um índice"; DEV="$2"; shift 2 ;;
+    -l | --lang) [ -n "${2:-}" ] || die "-l requires a language code"; LANG_CODE="$2"; shift 2 ;;
+    -l=* | --lang=*) LANG_CODE="${1#*=}"; shift ;;
+    -k | --keyterms) [ -n "${2:-}" ] || die "-k requires a list of terms"; KEYTERMS="$2"; shift 2 ;;
+    -k=* | --keyterms=*) KEYTERMS="${1#*=}"; shift ;;
+    -s | --speakers) [ -n "${2:-}" ] || die "-s requires a number"; SPEAKERS="$2"; shift 2 ;;
+    -s=* | --speakers=*) SPEAKERS="${1#*=}"; shift ;;
+    -d | --device) [ -n "${2:-}" ] || die "-d requires an index"; DEV="$2"; shift 2 ;;
+    -d=* | --device=*) DEV="${1#*=}"; shift ;;
+    --open) OPEN=true; shift ;;
     --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
-    -*) die "opção desconhecida: $1 (veja --help)" ;;
+    -*) die "unknown option: $1 (see --help)" ;;
     *) positional+=("$1"); shift ;;
   esac
 done
 set -- "${positional[@]}"
 
-command -v ffmpeg >/dev/null || die "ffmpeg não encontrado — instale: brew install ffmpeg"
+command -v ffmpeg >/dev/null || die "ffmpeg not found — install: brew install ffmpeg"
 
-PARENT="${OUTBASE:-$HOME/VozMemos}"
-mkdir -p "$PARENT" || die "não consegui criar $PARENT"
+PARENT="${OUTBASE:-$HOME/VoiceMemos}"
+mkdir -p "$PARENT" || die "could not create $PARENT"
 PARENT=$(cd "$PARENT" && pwd)
 
 NAME="${1:-$(date +%Y-%m-%d-%H%M%S)}"
 AUDIO="$PARENT/$NAME.opus"
 
-echo "🔴 gravando de [:$DEV] — aperte  q  pra parar (Ctrl-C também)" >&2
-# avfoundation: ":$DEV" = sem vídeo, dispositivo de áudio $DEV
+echo "🔴 recording from [:$DEV] — press  q  to stop & transcribe  ·  Ctrl-C to cancel" >&2
+# Distinguish stop (q -> keep) from cancel (Ctrl-C -> discard): trap SIGINT so a
+# Ctrl-C marks the take as cancelled; ffmpeg finalizes either way, we discard on cancel.
+CANCELLED=false
+trap 'CANCELLED=true' INT
 ffmpeg -hide_banner -loglevel error -stats -y -f avfoundation -i ":$DEV" \
   -ac 1 -c:a libopus -b:a 48k "$AUDIO" || true
+trap - INT
 
-[ -s "$AUDIO" ] || die "nada foi gravado — o app do terminal tem permissão de microfone? (veja --help)"
+if $CANCELLED; then
+  rm -f "$AUDIO"
+  printf '\n✖ cancelled — recording discarded\n' >&2
+  exit 130
+fi
+
+[ -s "$AUDIO" ] || die "nothing was recorded — does your terminal app have microphone permission? (see --help)"
 secs=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$AUDIO" 2>/dev/null | cut -d. -f1)
-echo "💾 áudio salvo: $AUDIO (${secs:-?}s)" >&2
+echo "💾 audio saved: $AUDIO (${secs:-?}s)" >&2
 
-$AUDIO_ONLY && exit 0
+if $AUDIO_ONLY; then
+  $OPEN && command -v open >/dev/null && open -R "$AUDIO" || true
+  exit 0
+fi
 
 command -v transcribe >/dev/null ||
-  die "comando 'transcribe' não encontrado — instale-o pra transcrever, ou use -a pra só gravar"
-echo "📝 transcrevendo..." >&2
-transcribe -o "$PARENT" "$AUDIO" "$LANG_CODE"
+  die "command 'transcribe' not found — install it to transcribe, or use -a to record only"
+echo "📝 transcribing..." >&2
+args=(-o "$PARENT" -l "$LANG_CODE")
+[ -n "$KEYTERMS" ] && args+=(-k "$KEYTERMS")
+[ -n "$SPEAKERS" ] && args+=(-s "$SPEAKERS")
+$OPEN && args+=(--open)
+transcribe "${args[@]}" "$AUDIO"
