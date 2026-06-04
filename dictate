@@ -8,6 +8,9 @@ PROG=${0##*/}
 err() { printf '%s: %s\n' "$PROG" "$1" >&2; }
 die() { err "$1"; exit "${2:-1}"; }
 
+# Restore the cursor on any exit (safety net for the live UI below).
+trap '[ -t 2 ] && printf "\033[?25h" >&2 || true' EXIT
+
 # "2h" | "90m" | "30s" | "7200" -> seconds (echoes empty if not a valid integer duration)
 to_seconds() {
   local v="$1" n
@@ -17,6 +20,46 @@ to_seconds() {
     *s) n="${v%s}"; case "$n" in *[!0-9]* | "") echo ""; return ;; esac; echo "$n" ;;
     *)  case "$v" in *[!0-9]* | "") echo ""; return ;; esac; echo "$v" ;;
   esac
+}
+
+# Record the mic to $AUDIO. Runs ffmpeg in the background so we can draw a live
+# UI (pulsing dot + timer) and handle keys ourselves; q stops, Ctrl-C cancels.
+# Falls back to a plain run when stdin/stderr isn't a TTY (pipes, cron).
+record() {
+  ffmpeg -hide_banner -loglevel quiet -y -f avfoundation -i ":$DEV" \
+    -ac 1 -c:a libopus -b:a 48k -t "$MAXSECS" "$AUDIO" </dev/null >/dev/null 2>&1 &
+  local ff=$!
+
+  if ! { [ -t 0 ] && [ -t 2 ]; }; then
+    echo "🔴 recording (max $MAXDUR)…" >&2
+    trap 'CANCELLED=true; kill -INT "'"$ff"'" 2>/dev/null' INT
+    wait "$ff" 2>/dev/null || true
+    trap - INT
+    return
+  fi
+
+  local dt shades n start=$SECONDS frame=0 key e
+  if [ "${BASH_VERSINFO[0]:-3}" -ge 4 ]; then
+    dt=0.15; shades=(88 124 160 196 160 124); n=6   # smooth breathing
+  else
+    dt=1; shades=(196 238); n=2                      # 1s blink (old bash)
+  fi
+
+  printf '\033[?25l' >&2                              # hide cursor
+  trap 'CANCELLED=true' INT
+  while kill -0 "$ff" 2>/dev/null && ! $CANCELLED; do
+    e=$((SECONDS - start))
+    printf '\r\033[K  \033[38;5;%sm●\033[0m \033[2mREC\033[0m  \033[1m%02d:%02d\033[0m   \033[2mq stop · ^C cancel · max %s\033[0m' \
+      "${shades[$((frame % n))]}" "$((e / 60))" "$((e % 60))" "$MAXDUR" >&2
+    if read -rsn1 -t "$dt" key 2>/dev/null; then
+      case "$key" in q | Q) break ;; esac
+    fi
+    frame=$((frame + 1))
+  done
+  trap - INT
+  printf '\r\033[K\033[?25h' >&2                      # clear line, show cursor
+  kill -INT "$ff" 2>/dev/null || true
+  wait "$ff" 2>/dev/null || true
 }
 
 usage() {
@@ -93,15 +136,8 @@ PARENT=$(cd "$PARENT" && pwd)
 NAME="${1:-$(date +%Y-%m-%d-%H%M%S)}"
 AUDIO="$PARENT/$NAME.opus"
 
-echo "🔴 recording from [:$DEV] (max $MAXDUR) — press  q  to stop & transcribe  ·  Ctrl-C to cancel" >&2
-# Distinguish stop (q -> keep) from cancel (Ctrl-C -> discard): trap SIGINT so a
-# Ctrl-C marks the take as cancelled; ffmpeg finalizes either way, we discard on cancel.
-# -t caps the duration so a forgotten recording stops on its own.
 CANCELLED=false
-trap 'CANCELLED=true' INT
-ffmpeg -hide_banner -loglevel error -stats -y -f avfoundation -i ":$DEV" \
-  -ac 1 -c:a libopus -b:a 48k -t "$MAXSECS" "$AUDIO" || true
-trap - INT
+record
 
 if $CANCELLED; then
   rm -f "$AUDIO"
@@ -120,7 +156,7 @@ fi
 
 command -v transcribe >/dev/null ||
   die "command 'transcribe' not found — install it to transcribe, or use -a to record only"
-echo "📝 transcribing..." >&2
+echo "📝 transcribing…" >&2
 args=(-o "$PARENT" -l "$LANG_CODE")
 [ -n "$KEYTERMS" ] && args+=(-k "$KEYTERMS")
 [ -n "$SPEAKERS" ] && args+=(-s "$SPEAKERS")
