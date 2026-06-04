@@ -76,9 +76,9 @@ Always creates the subfolder `<name>.transcript/` (next to the file; in the curr
 | `<name>.txt` | plain text |
 | `<name>.json` | raw ElevenLabs response (word-level timing) |
 
-## `dictate` — record the microphone
+## `dictate` — record the microphone (or system audio)
 
-Companion that records the mic right in the terminal and transcribes it (reusing `transcribe`).
+Companion that records right in the terminal and transcribes it (reusing `transcribe`).
 
 ```bash
 dictate                       # record → q to stop → transcribe. Saves to ~/VoiceMemos/
@@ -87,12 +87,39 @@ dictate -a memo               # record only, do NOT transcribe
 dictate -o ~/Desktop note     # choose where to save
 dictate -l en                 # transcription language (default: pt)
 dictate -k "Gauss" -s 2       # same accuracy flags as transcribe
-dictate -d 1                  # another microphone (--list shows the indices)
+dictate -d shure              # pick a device by name (or index); --list shows them
+dictate --source system       # capture the computer's audio output (see setup below)
+dictate --source both         # mic + system together
 ```
 
 While recording: press **`q`** to stop & transcribe, or **`Ctrl-C`** to cancel (the recording is discarded). Output: `<dir>/<name>.opus` and, unless `-a`, `<dir>/<name>.transcript/`.
 
 > **Permission:** macOS requires your terminal app to have microphone access (*Settings → Privacy → Microphone*). The first recording prompts for it; if denied, `dictate` tells you nothing was captured.
+
+### Choosing a device (`--set-device`)
+
+`dictate` captures your built-in mic by default. To set a preferred device — and to enable `--source system`/`both` — run the picker once (re-run it any time you swap a mic):
+
+```bash
+dictate --set-device          # lists inputs, asks which is your mic / system / both
+```
+
+It saves your choices **by name** (e.g. `Shure MV7`) in `~/.config/transcribe/devices`, so it keeps working even when the device index shifts between reboots. `-d <ref>` always overrides for a single run, accepting a name fragment (`-d shure`) or an index (`-d 1`).
+
+### Capturing system audio (one-time macOS setup)
+
+macOS can't capture the computer's audio output directly — you route it through a **virtual audio device** and record that. The standard, free tool is [BlackHole](https://github.com/ExistentialAudio/BlackHole):
+
+```bash
+brew install blackhole-2ch
+```
+
+Then, in **Audio MIDI Setup** (`/Applications/Utilities`):
+
+- **`--source system`** — create a **Multi-Output Device** containing your speakers/headphones **+ BlackHole**, and select it as your Mac's output (so you still hear the audio while BlackHole receives a copy). Run `dictate --set-device` and point *system* at **BlackHole 2ch**.
+- **`--source both`** (mic + system) — create an **Aggregate Device** containing your **mic + BlackHole**, then point *both* at that Aggregate in `dictate --set-device`.
+
+> Why not the newer native API? macOS 14.2+ added Core Audio "process taps" that capture system audio without a virtual device, but the CLI tooling for it is still build-from-source with an unstable API and a non-standard chunked output — not yet a clean fit for an `ffmpeg` pipeline. BlackHole remains the pragmatic, one-command path.
 
 ## How it works
 

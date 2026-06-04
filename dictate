@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dictate — record the microphone and transcribe (companion to transcribe).
+# dictate — record the microphone (or system audio) and transcribe.
 
 set -eo pipefail
 
@@ -8,8 +8,94 @@ PROG=${0##*/}
 err() { printf '%s: %s\n' "$PROG" "$1" >&2; }
 die() { err "$1"; exit "${2:-1}"; }
 
+DEVCFG="$HOME/.config/transcribe/devices"
+
 # Restore the cursor on any exit (safety net for the live UI below).
 trap '[ -t 2 ] && printf "\033[?25h" >&2 || true' EXIT
+
+# List avfoundation audio inputs as  "<index>\t<name>"  lines.
+# ffmpeg exits non-zero on the probe (no real input) — the `|| true` keeps that
+# from tripping `set -e`/pipefail.
+list_audio() {
+  ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | awk '
+    /AVFoundation video devices/ { a=0; next }
+    /AVFoundation audio devices/ { a=1; next }
+    a && match($0, /\[[0-9]+\] /) {
+      print substr($0, RSTART+1, RLENGTH-3) "\t" substr($0, RSTART+RLENGTH)
+    }' || true
+}
+
+# Resolve a device reference to an avfoundation index. A pure integer is used
+# as-is; anything else is matched (case-insensitive, substring) against names —
+# so "shure" finds "Shure MV7" regardless of how the index shifts day to day.
+# Echoes the index, or nothing if no match.
+resolve_device() {
+  local q="$1" idx name found="" ql
+  case "$q" in '' | *[!0-9]*) ;; *) printf '%s\n' "$q"; return 0 ;; esac
+  ql=$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')
+  while IFS=$'\t' read -r idx name; do
+    [ -n "$found" ] && continue
+    case "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" in
+      *"$ql"*) found="$idx" ;;
+    esac
+  done < <(list_audio)
+  [ -n "$found" ] && printf '%s\n' "$found"
+  return 0   # never fail: callers check for empty output, and set -e would abort on a non-zero substitution
+}
+
+# Read a saved default device NAME (MIC/SYSTEM/BOTH) from the config.
+cfg_get() { [ -f "$DEVCFG" ] && grep -m1 "^$1=" "$DEVCFG" | cut -d= -f2- || true; }
+
+# Interactive picker: list inputs, ask which is mic / system / both, save by
+# name. Re-run any time you swap a microphone — it just rewrites the defaults.
+set_device() {
+  command -v ffmpeg >/dev/null || die "ffmpeg not found — install: brew install ffmpeg"
+  mkdir -p "$(dirname "$DEVCFG")"
+  echo "" >&2
+  echo "Audio input devices (index — name):" >&2
+  list_audio | awk -F'\t' '{printf "  %s — %s\n", $1, $2}' >&2
+  echo "" >&2
+  echo "Type an index or part of a name for each role. Empty = keep current / skip." >&2
+  echo "(system/both need BlackHole + an Aggregate Device — see the README.)" >&2
+  echo "" >&2
+
+  local r cur ans idx name prompt
+  local newmic newsys newboth
+  for r in MIC SYSTEM BOTH; do
+    cur=$(cfg_get "$r")
+    case "$r" in
+      MIC)    prompt="  Mic" ;;
+      SYSTEM) prompt="  System audio (e.g. BlackHole 2ch)" ;;
+      BOTH)   prompt="  Both — mic+system (Aggregate Device)" ;;
+    esac
+    printf '%s%s: ' "$prompt" "${cur:+ [$cur]}" >&2
+    IFS= read -r ans </dev/tty || ans=""
+    if [ -z "$ans" ]; then
+      name="$cur"
+    else
+      idx=$(resolve_device "$ans")
+      if [ -z "$idx" ]; then
+        err "no device matches '$ans' — kept previous"
+        name="$cur"
+      else
+        name=$(list_audio | awk -F'\t' -v i="$idx" '$1==i{print $2; exit}')
+      fi
+    fi
+    case "$r" in MIC) newmic="$name" ;; SYSTEM) newsys="$name" ;; BOTH) newboth="$name" ;; esac
+  done
+
+  ( umask 077; {
+      printf 'MIC=%s\n' "$newmic"
+      printf 'SYSTEM=%s\n' "$newsys"
+      printf 'BOTH=%s\n' "$newboth"
+    } >"$DEVCFG" )
+
+  echo "" >&2
+  echo "✓ saved to $DEVCFG" >&2
+  [ -n "$newmic" ] && echo "    mic:    $newmic" >&2
+  [ -n "$newsys" ] && echo "    system: $newsys" >&2
+  [ -n "$newboth" ] && echo "    both:   $newboth" >&2
+}
 
 # "2h" | "90m" | "30s" | "7200" -> seconds (echoes empty if not a valid integer duration)
 to_seconds() {
@@ -22,9 +108,9 @@ to_seconds() {
   esac
 }
 
-# Record the mic to $AUDIO. Runs ffmpeg in the background so we can draw a live
-# UI (pulsing dot + timer) and handle keys ourselves; q stops, Ctrl-C cancels.
-# Falls back to a plain run when stdin/stderr isn't a TTY (pipes, cron).
+# Record from device index $DEV to $AUDIO. Runs ffmpeg in the background so we
+# can draw a live UI (pulsing dot + timer) and handle keys ourselves; q stops,
+# Ctrl-C cancels. Falls back to a plain run when stdin/stderr isn't a TTY.
 record() {
   ffmpeg -hide_banner -loglevel quiet -y -f avfoundation -i ":$DEV" \
     -ac 1 -c:a libopus -b:a 48k -t "$MAXSECS" "$AUDIO" </dev/null >/dev/null 2>&1 &
@@ -49,8 +135,8 @@ record() {
   trap 'CANCELLED=true' INT
   while kill -0 "$ff" 2>/dev/null && ! $CANCELLED; do
     e=$((SECONDS - start))
-    printf '\r\033[K  \033[38;5;%sm●\033[0m \033[2mREC\033[0m  \033[1m%02d:%02d\033[0m   \033[2mq stop · ^C cancel · max %s\033[0m' \
-      "${shades[$((frame % n))]}" "$((e / 60))" "$((e % 60))" "$MAXDUR" >&2
+    printf '\r\033[K  \033[38;5;%sm●\033[0m \033[2m%s\033[0m  \033[1m%02d:%02d\033[0m   \033[2mq stop · ^C cancel · max %s\033[0m' \
+      "${shades[$((frame % n))]}" "$REC_LABEL" "$((e / 60))" "$((e % 60))" "$MAXDUR" >&2
     if read -rsn1 -t "$dt" key 2>/dev/null; then
       case "$key" in q | Q) break ;; esac
     fi
@@ -64,23 +150,31 @@ record() {
 
 usage() {
   cat >&2 <<'EOF'
-dictate — record the microphone and transcribe
+dictate — record the microphone (or system audio) and transcribe
 
 Usage:
   dictate [options] [name]
 
 Options:
-  -a, --audio-only     record only, do NOT transcribe
-  -o, --out <dir>      where to save (default: ~/VoiceMemos)
-  -l, --lang <code>    transcription language (default: pt; "auto" to detect)
-  -k, --keyterms <l>   comma-separated terms/names to boost accuracy
-  -s, --speakers <n>   expected number of speakers
-  -d, --device <i>     audio input device index (default: 0)
-  -t, --max <dur>      max recording length, auto-stops (default: 2h; e.g. 90m, 30s)
-      --open           open the result when done
-      --list           list capture devices and exit
+  -a, --audio-only      record only, do NOT transcribe
+  -o, --out <dir>       where to save (default: ~/VoiceMemos)
+  -l, --lang <code>     transcription language (default: pt; "auto" to detect)
+  -k, --keyterms <l>    comma-separated terms/names to boost accuracy
+  -s, --speakers <n>    expected number of speakers
+      --source <s>      what to capture: mic | system | both (default: mic)
+  -d, --device <ref>    capture device by index OR name (e.g. 1, "shure"); overrides --source
+      --set-device      pick & save your default mic/system/both devices (re-run any time)
+  -t, --max <dur>       max recording length, auto-stops (default: 2h; e.g. 90m, 30s)
+      --open            open the result when done
+      --list            list capture devices and exit
   -h, --help
-  name                 base file name (default: timestamp)
+  name                  base file name (default: timestamp)
+
+Sources:
+  mic     your microphone (default; no setup needed)
+  system  the computer's output — needs a virtual device (BlackHole) + --set-device
+  both    mic + system together — needs an Aggregate Device + --set-device
+  (See the README for the one-time BlackHole / Audio MIDI Setup steps.)
 
 While recording:  press  q  to stop & transcribe  ·  Ctrl-C to cancel (discard).
 Recording auto-stops at the --max cap (default 2h) to avoid runaway captures.
@@ -92,15 +186,17 @@ terminal app (Settings > Privacy > Microphone). To transcribe: the transcribe co
 EOF
 }
 
-OUTBASE=""; LANG_CODE="pt"; DEV="0"; AUDIO_ONLY=false; KEYTERMS=""; SPEAKERS=""; OPEN=false; MAXDUR="2h"
+OUTBASE=""; LANG_CODE="pt"; DEV_OVERRIDE=""; SOURCE="mic"; AUDIO_ONLY=false
+KEYTERMS=""; SPEAKERS=""; OPEN=false; MAXDUR="2h"
 positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     --list)
-      ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 |
-        sed -n '/audio devices/,$ p' | grep -E '^\[.*\] \[[0-9]+\]' || true
+      echo "Audio input devices:" >&2
+      list_audio | awk -F'\t' '{printf "  %s — %s\n", $1, $2}'
       exit 0 ;;
+    --set-device) set_device; exit 0 ;;
     -a | --audio-only) AUDIO_ONLY=true; shift ;;
     -o | --out) [ -n "${2:-}" ] || die "-o requires a directory"; OUTBASE="$2"; shift 2 ;;
     -o=* | --out=*) OUTBASE="${1#*=}"; shift ;;
@@ -110,8 +206,10 @@ while [ $# -gt 0 ]; do
     -k=* | --keyterms=*) KEYTERMS="${1#*=}"; shift ;;
     -s | --speakers) [ -n "${2:-}" ] || die "-s requires a number"; SPEAKERS="$2"; shift 2 ;;
     -s=* | --speakers=*) SPEAKERS="${1#*=}"; shift ;;
-    -d | --device) [ -n "${2:-}" ] || die "-d requires an index"; DEV="$2"; shift 2 ;;
-    -d=* | --device=*) DEV="${1#*=}"; shift ;;
+    -S | --source) [ -n "${2:-}" ] || die "--source requires mic|system|both"; SOURCE="$2"; shift 2 ;;
+    -S=* | --source=*) SOURCE="${1#*=}"; shift ;;
+    -d | --device) [ -n "${2:-}" ] || die "-d requires an index or name"; DEV_OVERRIDE="$2"; shift 2 ;;
+    -d=* | --device=*) DEV_OVERRIDE="${1#*=}"; shift ;;
     -t | --max) [ -n "${2:-}" ] || die "-t requires a duration"; MAXDUR="$2"; shift 2 ;;
     -t=* | --max=*) MAXDUR="${1#*=}"; shift ;;
     --open) OPEN=true; shift ;;
@@ -123,6 +221,30 @@ done
 set -- "${positional[@]}"
 
 command -v ffmpeg >/dev/null || die "ffmpeg not found — install: brew install ffmpeg"
+
+# --- resolve the capture device (index) from -d override or --source config ---
+REC_LABEL="REC"
+if [ -n "$DEV_OVERRIDE" ]; then
+  DEV=$(resolve_device "$DEV_OVERRIDE")
+  [ -n "$DEV" ] || die "no audio device matches '$DEV_OVERRIDE' — see: dictate --list"
+else
+  case "$SOURCE" in
+    mic)    _want=$(cfg_get MIC);    REC_LABEL="REC" ;;
+    system) _want=$(cfg_get SYSTEM); REC_LABEL="SYS" ;;
+    both)   _want=$(cfg_get BOTH);   REC_LABEL="MIX" ;;
+    *) die "invalid --source '$SOURCE' (use: mic, system, or both)" ;;
+  esac
+  if [ -n "$_want" ]; then
+    DEV=$(resolve_device "$_want")
+    [ -n "$DEV" ] || die "the '$SOURCE' device ('$_want') isn't connected — reconnect it or run: dictate --set-device"
+  elif [ "$SOURCE" = "mic" ]; then
+    DEV=0   # sensible default — the built-in mic, matching the old behavior
+  elif [ "$SOURCE" = "system" ]; then
+    die "no 'system' device set. Install BlackHole (brew install blackhole-2ch), route the output into it, then run: dictate --set-device  (see README)"
+  else
+    die "no 'both' device set. Create an Aggregate Device (your mic + BlackHole) in Audio MIDI Setup, then run: dictate --set-device  (see README)"
+  fi
+fi
 
 MAXSECS=$(to_seconds "$MAXDUR")
 if [ -z "$MAXSECS" ] || [ "$MAXSECS" -le 0 ]; then
