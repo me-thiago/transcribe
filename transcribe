@@ -106,7 +106,7 @@ if [ -n "$REMOTE" ]; then
   command -v ssh >/dev/null || die "ssh not found"
   msg "streaming from $REMOTE over SSH + extracting audio..."
   ssh "$REMOTE" "cat \"$RPATH\"" |
-    ffmpeg -hide_banner -loglevel error -y -i pipe:0 -vn -ac 1 -c:a libopus -b:a 48k "$WORK/audio.opus"
+    ffmpeg -hide_banner -loglevel error -err_detect ignore_err -y -i pipe:0 -vn -ac 1 -c:a libopus -b:a 48k "$WORK/audio.opus"
   UPLOAD="$WORK/audio.opus"; UPLOAD_NAME="audio.opus"
 else
   is_video=false
@@ -121,7 +121,10 @@ else
   if $is_video || [ "$size" -gt 104857600 ]; then
     command -v ffmpeg >/dev/null || die "ffmpeg is required for video/large audio — install: brew install ffmpeg"
     msg "extracting audio with ffmpeg..."
-    ffmpeg -hide_banner -loglevel error -y -i "$INPUT" -vn -ac 1 -c:a libopus -b:a 48k "$WORK/audio.opus"
+    # -nostdin: don't consume the terminal's stdin (avoids ffmpeg exiting non-zero
+    #   in some interactive shells). -err_detect ignore_err: tolerate a corrupt/
+    #   truncated tail (common in interrupted recordings) instead of aborting.
+    ffmpeg -nostdin -hide_banner -loglevel error -err_detect ignore_err -y -i "$INPUT" -vn -ac 1 -c:a libopus -b:a 48k "$WORK/audio.opus"
     UPLOAD="$WORK/audio.opus"; UPLOAD_NAME="audio.opus"
   else
     UPLOAD="$INPUT"; UPLOAD_NAME="audio.$EXT"
